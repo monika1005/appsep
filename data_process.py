@@ -1,177 +1,185 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-@file: data_process.py
+@file: app_data.py
 @author: YQ
-@date: 2026-05-12
-@desc: 数据处理部分
+@date: 2026-05-15
+@desc: app 数据预处理
 """
 
-import polars,pandas,gc,yaml
-from collections import Counter
-pandas.set_option('display.max_rows', None)
-pandas.set_option('display.max_columns', None)
-pandas.set_option('display.width', None)
-
-from IPython.core.interactiveshell import InteractiveShell
-InteractiveShell.ast_node_interactivity = "all"
-# import matplotlib.pyplot as plt 
+import os
+import json
+import yaml
+import polars
+from typing import Optional, Callable
 
 
+'''
+input: pd.DataFrame '[{"appName":"com.whatsapp.w4b","appTitle":"WhatsApp\xa0Business","firstInstallTime":1762980542265,"lastUpdateTime":1773526029835},
+                      {"appName":"com.truecaller","appTitle":"Truecaller","firstInstallTime":1774270611614,"lastUpdateTime":1774270611614}]'
+
+output: pd.DataFrame [8,9]
+'''
+
+class AppSeqProcess:
+    def __init__(
+        self,
+        data_dir: str,
+        min_app_count: int = 200,
+        max_vocab_size: int = 10000,
+        vocab_save_path: str = "app2id.yaml",
+        output_parquet_path: str = "./yq1005/df_app.parquet",
+        input_col: str = "app_name",           
+        output_col: str = "app_name_encoded",  
+        sort_key: str = "lastUpdateTime",     
+        sort_desc: bool = True,             
+        extract_key: str = "appName",          
+        extra_sources: Optional[list[str]] = None, 
+    ):
+        self.data_dir = data_dir
+        self.min_app_count = min_app_count
+        self.max_vocab_size = max_vocab_size
+        self.vocab_save_path = vocab_save_path
+        self.output_parquet_path = output_parquet_path
+
+        self.input_col = input_col
+        self.output_col = output_col
+        self.sort_key = sort_key
+        self.sort_desc = sort_desc
+        self.extract_key = extract_key
+        self.extra_sources = extra_sources or []
+
+        self.special_tokens: dict[str, int] = {
+            "[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "[MASK]": 4
+        }
+
+        self.df_app: Optional[polars.DataFrame] = None
+        self.app2id: Optional[dict[str, int]] = None
 
 
-from sqlalchemy.engine import create_engine
-from pyhive import hive
+    def _read_parquet(self, path: str, drop_cols: Optional[list[str]] = None) :
 
-hive_engine = hive.Connection(host='10.166.17.181', port='10000', username='qing.yu01',password='monika!2122',auth='LDAP')
+        df = polars.read_parquet(path)
+        if drop_cols:
+            df = df.drop([c for c in drop_cols if c in df.columns])
+        return df
 
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-from sqlalchemy import create_engine
-from urllib.parse import quote  # 密码中有url不允许的特殊字符
+    def _make_parser(self) :
 
+        sort_key, sort_desc, extract_key = self.sort_key, self.sort_desc, self.extract_key
 
-user = "qing.yu01"      # Replace with your LDAP username
-password = "monika!2122"  # Replace with your LDAP password
+        def parse_and_sort(json_str: str) -> list[str]:
+            if not json_str:
+                return []
+            try:
+                apps: list[dict] = json.loads(json_str)
+                apps.sort(key=lambda x: x.get(sort_key, 0), reverse=sort_desc)
+                return [app[extract_key] for app in apps if extract_key in app]
+            except (json.JSONDecodeError, TypeError):
+                return []
 
-# Create the connection string
-connection_string = (
-    f"trino://{user}:{quote(password)}@10.166.16.209:8443/hive/default"
-    f"?protocol=https"  # Use HTTPS for SSL
-    f"&verify=false"  # Verify SSL certificates
-)
-
-# Create SQLAlchemy engine
-trino_engine = create_engine(connection_string)
-
-def get_data(sql,engine):
-    df=pandas.read_sql(sql,engine)
-    columns = df.columns
-    columns_dict = {column:column.split('.')[-1] for column in columns}
-    df.rename(columns=columns_dict,inplace=True)
-    print(df.shape)
-    return df
+        return parse_and_sort
 
 
-from imp import reload
-import numpy as np
-import pandas as pd
+    def load_data(self):
 
-# import  opay_tools.model_train_new  as _model_train
-# reload(_model_train)
-
-# from opay_tools.model_train_new import TrainAndSave, WeightPipeline, make_auc_lift_metric
-
-
-import os,polars
-import random
-import datetime
-import pickle
-from typing import Tuple, List, Union
-
-import numpy as np
-import pandas as pd
-import xgboost,lightgbm
-from scipy import stats
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
-
-
-def optimize_app_df(app_df):
-
-    apply_ts_series = (
-        pd.to_datetime(app_df['apply_time'].astype(str), format='%Y%m%d%H%M%S')
-        .astype('int64') // 10**6  # ns -> ms
-    ).to_numpy()
-
-    app_lst_arr = app_df['app_lst'].to_numpy()
-
-    INF = float('inf')
-    result = [None] * len(app_lst_arr)
-
-    for i, apps in enumerate(app_lst_arr):
-        if not apps:
-            result[i] = []
-            continue
-        ts = apply_ts_series[i]
-
-        picked = [
-            (app.get('firstInstallTime', INF), app['appName'])
-            for app in apps
-            if app.get('firstInstallTime', INF) < ts
-            and app.get('lastUpdateTime', INF) < ts
+        frames = [
+            self._read_parquet(os.path.join(self.data_dir, "app_df_ok.parquet"), drop_cols = ["rn"] ),
+            self._read_parquet(os.path.join(self.data_dir, "app_df_em.parquet"), drop_cols = ["rn"] ),
         ]
-        picked.sort(key=lambda x: x[0])
-        result[i] = [name for _, name in picked]
+        for path in self.extra_sources:
+            frames.append(self._read_parquet(path))
 
-    app_df['app_name'] = result
-    return app_df
+        self.df_app = polars.concat(frames, how="vertical")
+        print(f"数据加载完成，总样本数：{self.df_app.shape[0]}")
+        return self
 
+    def to_list(self):
+
+        self.df_app = self.df_app.with_columns(
+            polars.col(self.input_col)
+                  .map_elements(self._make_parser(), return_dtype=polars.List(polars.String))
+                  .alias(self.input_col)
+        )
+        print(f"序列解析完成（排序字段={self.sort_key}, 降序={self.sort_desc}）")
+        return self
+
+    def build_vocab(self) :
+
+        app_counts = (
+            self.df_app.select(self.input_col)
+                       .explode(self.input_col)
+                       .drop_nulls(self.input_col)
+                       .group_by(self.input_col)
+                       .agg(polars.len().alias("count"))
+                       .filter(polars.col("count") >= self.min_app_count)
+                       .sort("count", descending=True)
+                       .head(self.max_vocab_size)
+        )
+        sorted_apps: list[str] = app_counts[self.input_col].to_list()
+        self.app2id = {
+            **self.special_tokens,
+            **{app: i + len(self.special_tokens) for i, app in enumerate(sorted_apps)}
+        }
+        print(f"词表构建完成，总词表大小：{len(self.app2id)}")
+        return self
+
+    def save_vocab(self) :
+        with open(self.vocab_save_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(self.app2id, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        print(f"词表已保存至：{self.vocab_save_path}")
+        return self
+
+    def encode_seq(self) :
+        keys = list(self.app2id.keys())
+        vals = list(self.app2id.values())
+        mapping = polars.DataFrame(
+            {self.input_col: keys, "app_id": vals},
+            schema={self.input_col: polars.String, "app_id": polars.Int32}
+        )
+        unk_id = self.special_tokens["[UNK]"]
+        self.df_app = self.df_app.with_columns(
+            polars.col(self.input_col)
+                  .list.eval(
+                      polars.element().replace(
+                          old=mapping[self.input_col],
+                          new=mapping["app_id"],
+                          default=polars.lit(unk_id, dtype=polars.Int32)
+                      )
+                  )
+                  .alias(self.output_col)
+        )
+        print("序列编码完成")
+        return self
+
+    def save_result(self) :
+        os.makedirs(os.path.dirname(self.output_parquet_path), exist_ok=True)
+        self.df_app.write_parquet(self.output_parquet_path)
+        print(f"结果已保存至：{self.output_parquet_path}")
+        return self
+
+    def main(self) :
+        (
+            self.load_data()
+                .to_list()
+                .build_vocab()
+                .save_vocab()
+                .encode_seq()
+                .save_result()
+        )
+        return self.df_app
 
 
 if __name__ == "__main__":
-    app_df_ok = polars.read_parquet('./yq1005/app_df_ok.parquet')
-    app_df_em = polars.read_parquet('./yq1005/app_df_em.parquet')
-    app_df_em = app_df_em.drop('rn')
-
-    df_app = polars.concat([app_df_ok,app_df_em],how = 'vertical')
-    df_app = df_app.with_columns(
-    polars.col("app_name").list.reverse().alias("app_name1")
+    run = AppSeqProcess(
+        data_dir="./yq1005",
+        min_app_count=200,
+        max_vocab_size=10000,
+        vocab_save_path="app2id.yaml",
+        output_parquet_path="./yq1005/df_app.parquet",
+        sort_key="lastUpdateTime",
+        sort_desc=True,
+        extract_key="appName",
     )
-
-    all_apps = (
-    df_app.select("app_name1")          
-          .explode("app_name1")
-          .drop_nulls("app_name1")
-          )
-
-    MIN_COUNT = 200
-    app_counts = (
-        all_apps.group_by("app_name1")
-                .agg(polars.len().alias("count"))
-                .filter(polars.col("count") >= MIN_COUNT)
-                .sort("count", descending=True)
-                .head(10000)
-    )
-
-    del all_apps   
-
-    SPECIAL_TOKENS = {"[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "[MASK]": 4}
-    sorted_apps = app_counts["app_name1"].to_list()
-    del app_counts       
-
-    app2id = {**SPECIAL_TOKENS, **{app: i + 5 for i, app in enumerate(sorted_apps)}}
-    del sorted_apps
-
-
-    with open("app2id_new.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(app2id, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
-
-    print(f"词表大小: {len(app2id)}")   
-
-    mapping = polars.DataFrame({
-    "app_name1": list(app2id.keys()),
-    "app_id":    list(app2id.values()),
-    }, schema={"app_name1": polars.String, "app_id": pl.Int32})
-
-
-
-    app_name_series = polars.Series("app_name1", list(app2id.keys()), dtype=polars.String)
-    app_id_series   = polars.Series("app_id",    list(app2id.values()), dtype=polars.Int32)
-
-    df_app = df_app.with_columns(
-        polars.col("app_name1")
-        .list.eval(
-            polars.element().replace(
-                old=app_name_series,
-                new=app_id_series,
-                default=polars.lit(1, dtype=polars.Int32),
-            )
-        )
-        .cast(polars.List(polars.Int32))
-        .alias("app_name_encoded")
-    )
-
-    df_app.write_parquet('./yq1005/df_app.parquet')
-
-
+    df_result = run.main()
+    print(df_result.columns)
