@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+@file: app_data.py
+@author: YQ
+@date: 2026-05-15
+@desc: app MLM预训练
 """
 
 import datetime
