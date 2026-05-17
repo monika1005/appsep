@@ -1,45 +1,75 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-@file: app_data.py
+@file: app_pretrain.py
 @author: YQ
-@date: 2026-05-15
-@desc: app MLM预训练
+@date: 2026-05-17
+@desc: app MLM 预训练（优化版）
+
+优化点：
+  - argparse CLI 覆盖超参，无需改源码
+  - 单卡/多卡自动兼容（DDP 按需初始化）
+  - Gradient Checkpointing（用重计算换显存）
+  - fp16 默认，--bf16 可切换
+  - EarlyStoppingCallback（默认 patience=3）
+  - 自动断点续训（检测已有 checkpoint）
+  - Warmup 步数精确计算并打印
+  - DataLoader worker 随机状态隔离（子类覆盖 get_train_dataloader）
+  - REPORT_TO 环境变量控制监控后端
+  - --dry-run 快速验证链路（只跑 10 步）
+
+用法示例：
+  # 单卡
+  python app_pretrain.py
+
+  # 多卡
+  torchrun --nproc_per_node=4 app_pretrain.py
+
+  # 调参
+  python app_pretrain.py --lr 1e-4 --epochs 20 --batch-size 32
+
+  # 切换 bf16 + 禁用 gradient checkpointing
+  python app_pretrain.py --bf16 --no-gc
+
+  # 快速链路验证
+  python app_pretrain.py --dry-run
+
+  # 接入 TensorBoard
+  REPORT_TO=tensorboard python app_pretrain.py
 """
 
+import argparse
 import datetime
 import os
 import random
-import pickle
-import time
+
 import polars
-
-
-
 import torch
-from torch import nn
-from datasets import Dataset
-import torch.nn.functional as F
 import torch.distributed as dist
-from datasets import load_from_disk
-from torch.utils.data import Dataset
-
+import torch.nn.functional as F
+import torch.utils.checkpoint
+from datasets import Dataset, load_from_disk
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
 from typing import Optional, Dict, List
 
 from transformers import (
+    BertConfig,
+    EarlyStoppingCallback,
+    PreTrainedModel,
     Trainer,
     TrainingArguments,
     set_seed,
-    BertConfig,
-    PreTrainedModel,
-    EarlyStoppingCallback,
 )
 from transformers.configuration_utils import PretrainedConfig
+from transformers.trainer_utils import seed_worker
 
 
+# ─── 特殊 Token ────────────────────────────────────────────────────────────────
 PAD_ID, UNK_ID, CLS_ID, SEP_ID, MASK_ID = 0, 1, 2, 3, 4
 SPECIAL_TOKEN_NUM = 5
 
+# ─── 默认超参（CLI 可覆盖） ────────────────────────────────────────────────────
 VOCAB_SIZE = 10005
 MAX_LEN    = 200
 HIDDEN     = 256
@@ -55,42 +85,70 @@ EPOCHS     = 10
 LR         = 5e-4
 SEED       = 42
 
-OUTPUT_DIR      = f"./ckpt_app_mlm_{int(datetime.datetime.now().timestamp()*1000)}"
-CACHE_DIR       = "./cache"
-CACHE_TRAIN_HF  = os.path.join(CACHE_DIR, "train_hf")
+CACHE_DIR      = "./cache"
+CACHE_TRAIN_HF = os.path.join(CACHE_DIR, "train_hf")
 CACHE_VAL_HF   = os.path.join(CACHE_DIR, "val_hf")
+DATA_PATH      = "./df_app.parquet/df_app.parquet"
+TRAIN_RATIO    = 0.7
 
-DATA_PATH   = "./df_app.parquet/df_app.parquet"
-TRAIN_RATIO = 0.7
 
-
-def is_main():
+# ─── 工具函数 ──────────────────────────────────────────────────────────────────
+def is_main() -> bool:
     return int(os.environ.get("RANK", 0)) == 0
 
-def log(msg: str):
+
+def log(msg: str) -> None:
     if is_main():
         print(msg, flush=True)
 
-def barrier():
+
+def barrier() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
 
+def worker_init_fn(worker_id: int) -> None:
+    """每个 DataLoader worker 独立随机状态，避免多进程 mask 相关性"""
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed)
 
+
+# ─── CLI ───────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="App MLM 预训练")
+    p.add_argument("--data-path",    default=DATA_PATH,   help="Parquet 数据路径")
+    p.add_argument("--output-dir",   default=None,        help="输出目录（默认带时间戳自动生成）")
+    p.add_argument("--epochs",       type=int,   default=EPOCHS)
+    p.add_argument("--lr",           type=float, default=LR)
+    p.add_argument("--batch-size",   type=int,   default=PER_DEV_BS,  dest="batch_size")
+    p.add_argument("--grad-accum",   type=int,   default=GRAD_ACCUM,  dest="grad_accum")
+    p.add_argument("--max-len",      type=int,   default=MAX_LEN,     dest="max_len")
+    p.add_argument("--hidden",       type=int,   default=HIDDEN)
+    p.add_argument("--layers",       type=int,   default=LAYERS)
+    p.add_argument("--warmup-ratio", type=float, default=0.05,        dest="warmup_ratio")
+    p.add_argument("--patience",     type=int,   default=3,           help="EarlyStopping patience（epoch 数）")
+    p.add_argument("--bf16",         action="store_true",             help="使用 bf16（Ampere+ GPU）；默认 fp16")
+    p.add_argument("--no-gc",        action="store_true",             help="禁用 gradient checkpointing")
+    p.add_argument("--dry-run",      action="store_true",             help="只跑 10 步，验证链路")
+    p.add_argument("--seed",         type=int,   default=SEED)
+    return p.parse_args()
+
+
+# ─── Dataset ───────────────────────────────────────────────────────────────────
 class AppMLMDataset(Dataset):
     def __init__(
         self,
-        sequences: List[List[int]],
-        max_len: int            = MAX_LEN,
-        vocab_size: int         = VOCAB_SIZE,
-        pad_id: int             = PAD_ID,
-        cls_id: int             = CLS_ID,
-        sep_id: int             = SEP_ID,
-        mask_id: int            = MASK_ID,
-        mlm_prob: float         = MLM_PROB,
-        random_token_start: int = SPECIAL_TOKEN_NUM,
-        is_train: bool          = True,
-        seed: int               = SEED,
+        sequences:          List[List[int]],
+        max_len:            int   = MAX_LEN,
+        vocab_size:         int   = VOCAB_SIZE,
+        pad_id:             int   = PAD_ID,
+        cls_id:             int   = CLS_ID,
+        sep_id:             int   = SEP_ID,
+        mask_id:            int   = MASK_ID,
+        mlm_prob:           float = MLM_PROB,
+        random_token_start: int   = SPECIAL_TOKEN_NUM,
+        is_train:           bool  = True,
+        seed:               int   = SEED,
     ):
         self.sequences          = sequences
         self.max_len            = max_len
@@ -121,9 +179,7 @@ class AppMLMDataset(Dataset):
                 if r < 0.8:
                     input_ids[i] = self.mask_id
                 elif r < 0.9:
-                    input_ids[i] = rng.randint(
-                        self.random_token_start, self.vocab_size - 1
-                    )
+                    input_ids[i] = rng.randint(self.random_token_start, self.vocab_size - 1)
 
         attention_mask  = [1] * len(input_ids)
         pad_len         = self.max_len - len(input_ids)
@@ -138,14 +194,33 @@ class AppMLMDataset(Dataset):
         }
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # 训练集使用 worker 本地 random（由 worker_init_fn 独立种种）
+        # 验证集固定种子，保证每次评估结果完全一致
         if self.is_train:
             return self._make_item(idx, random)
-        
         return self._make_item(idx, random.Random(self.seed + idx))
 
 
+# ─── Trainer 子类：注入 worker_init_fn ────────────────────────────────────────
+class AppMLMTrainer(Trainer):
+    """覆盖 get_train_dataloader，为每个 worker 设置独立随机状态"""
 
-def rotate_half(x: torch.Tensor):
+    def get_train_dataloader(self) -> DataLoader:
+        dl = super().get_train_dataloader()
+        return DataLoader(
+            dl.dataset,
+            batch_size      = dl.batch_sampler.batch_size if hasattr(dl.batch_sampler, "batch_size") else self.args.per_device_train_batch_size,
+            sampler         = dl.sampler,
+            num_workers     = dl.num_workers,
+            collate_fn      = dl.collate_fn,
+            pin_memory      = dl.pin_memory,
+            worker_init_fn  = worker_init_fn,
+            persistent_workers = dl.num_workers > 0,
+        )
+
+
+# ─── RoPE ─────────────────────────────────────────────────────────────────────
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
@@ -163,6 +238,7 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor):
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
+# ─── 模型组件 ──────────────────────────────────────────────────────────────────
 class AppEmbeddings(nn.Module):
     def __init__(self, config: BertConfig):
         super().__init__()
@@ -177,7 +253,7 @@ class AppEmbeddings(nn.Module):
             else None
         )
 
-    def forward(self, input_ids: torch.Tensor):
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         emb = self.word_embeddings(input_ids)
         emb = self.LayerNorm(emb)
         emb = self.dropout(emb)
@@ -200,17 +276,17 @@ class BertAttentionWithRoPE(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states:  torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) :
+    ) -> torch.Tensor:
         B, S, _ = hidden_states.shape
 
-        def _split(x):
+        def _split(x: torch.Tensor) -> torch.Tensor:
             return x.view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
 
-        q, k, v = _split(self.q_proj(hidden_states)), \
-                  _split(self.k_proj(hidden_states)), \
-                  _split(self.v_proj(hidden_states))
+        q = _split(self.q_proj(hidden_states))
+        k = _split(self.k_proj(hidden_states))
+        v = _split(self.v_proj(hidden_states))
 
         q, k = apply_rope(q, k)
 
@@ -236,13 +312,17 @@ class BertLayerWithRoPE(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states:  torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) :
-        hidden_states = self.ln1(hidden_states + self.attention(hidden_states, attention_mask))
-        hidden_states = self.ln2(hidden_states + self.dropout(
-            self.output(self.act(self.intermediate(hidden_states)))
-        ))
+    ) -> torch.Tensor:
+        hidden_states = self.ln1(
+            hidden_states + self.attention(hidden_states, attention_mask)
+        )
+        hidden_states = self.ln2(
+            hidden_states + self.dropout(
+                self.output(self.act(self.intermediate(hidden_states)))
+            )
+        )
         return hidden_states
 
 
@@ -252,34 +332,45 @@ class BertEncoderWithRoPE(nn.Module):
         self.layer = nn.ModuleList(
             [BertLayerWithRoPE(config) for _ in range(config.num_hidden_layers)]
         )
+        self.gradient_checkpointing = False
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states:  torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> tuple:
         for layer in self.layer:
-            hidden_states = layer(hidden_states, attention_mask)
+            if self.gradient_checkpointing and self.training:
+                # 用激活重计算换显存：前向不保存中间激活，反向时重新计算
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    layer,
+                    hidden_states,
+                    attention_mask,
+                    use_reentrant=False,  # 更稳定，与 autocast/AMP 兼容
+                )
+            else:
+                hidden_states = layer(hidden_states, attention_mask)
         return (hidden_states,)
 
 
+# ─── Config ────────────────────────────────────────────────────────────────────
 class AppConfig(BertConfig):
     model_type = "app"
 
     def __init__(
         self,
-        vocab_size: int   = VOCAB_SIZE,
-        emb_size: int     = EMB_SIZE,
-        hidden_size: int  = HIDDEN,
-        num_hidden_layers: int       = LAYERS,
-        num_attention_heads: int     = HEADS,
-        intermediate_size: int       = FFN,
-        max_position_embeddings: int = MAX_LEN,
-        hidden_dropout_prob: float             = 0.1,
-        attention_probs_dropout_prob: float    = 0.1,
-        pad_token_id: int   = PAD_ID,
-        layer_norm_eps: float      = 1e-12,
-        initializer_range: float   = 0.02,
+        vocab_size:                  int   = VOCAB_SIZE,
+        emb_size:                    int   = EMB_SIZE,
+        hidden_size:                 int   = HIDDEN,
+        num_hidden_layers:           int   = LAYERS,
+        num_attention_heads:         int   = HEADS,
+        intermediate_size:           int   = FFN,
+        max_position_embeddings:     int   = MAX_LEN,
+        hidden_dropout_prob:         float = 0.1,
+        attention_probs_dropout_prob:float = 0.1,
+        pad_token_id:                int   = PAD_ID,
+        layer_norm_eps:              float = 1e-12,
+        initializer_range:           float = 0.02,
         **kwargs,
     ):
         super().__init__(
@@ -305,17 +396,18 @@ class ModelConfig(PretrainedConfig):
 
     def __init__(
         self,
-        app_cfg: Optional[Dict] = None,
-        pad_token_id: int       = PAD_ID,
+        app_cfg:      Optional[Dict] = None,
+        pad_token_id: int            = PAD_ID,
         **kwargs,
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
-        self.app_config  = app_cfg or {}
+        self.app_config   = app_cfg or {}
         self.pad_token_id = pad_token_id
 
 
+# ─── 模型 ──────────────────────────────────────────────────────────────────────
 class AppMLM(PreTrainedModel):
-    config_class = ModelConfig
+    config_class                    = ModelConfig
     supports_gradient_checkpointing = True
 
     def __init__(self, config: ModelConfig):
@@ -336,19 +428,24 @@ class AppMLM(PreTrainedModel):
 
         self.post_init()
 
+    def _set_gradient_checkpointing(self, module: nn.Module, value: bool = False) -> None:
+        """HuggingFace Trainer 调用此方法启用/禁用 gradient checkpointing"""
+        if isinstance(module, BertEncoderWithRoPE):
+            module.gradient_checkpointing = value
+
     def get_extended_attention_mask(
         self, attention_mask: torch.Tensor, dtype: torch.dtype
-    ) :
+    ) -> torch.Tensor:
         ext = attention_mask[:, None, None, :].to(dtype=dtype)
         return (1.0 - ext) * torch.finfo(dtype).min
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids:      torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor]         = None,
+        labels:         Optional[torch.Tensor] = None,
         **kwargs,
-    ):
+    ) -> Dict[str, torch.Tensor]:
         if attention_mask is None:
             attention_mask = (input_ids != self.app_config.pad_token_id).long()
 
@@ -369,135 +466,175 @@ class AppMLM(PreTrainedModel):
         return {"logits": x @ emb_w.t() + self.mlm_bias}
 
 
-def make_args():
-    return TrainingArguments(
-        output_dir    = OUTPUT_DIR,
-        seed          = SEED,
-
-   
-        num_train_epochs            = EPOCHS,
-        per_device_train_batch_size = PER_DEV_BS,
-        per_device_eval_batch_size  = PER_DEV_BS,
-        gradient_accumulation_steps = GRAD_ACCUM,
-
-        # 优化器
-        learning_rate     = LR,
-        weight_decay      = 0.01,
-        warmup_ratio      = 0.05,
-        lr_scheduler_type = "cosine",
-        max_grad_norm     = 1.0,
-
-        eval_strategy          = "epoch",
-        save_strategy          = "epoch",
-        load_best_model_at_end = True,
-        metric_for_best_model  = "eval_loss",
-        greater_is_better      = False,
-        save_total_limit       = 3,
-
-        ddp_find_unused_parameters = False,
-        dataloader_num_workers     = 4,
-        dataloader_pin_memory      = True,
-
-        fp16 = True,
-        bf16 = False,
-
-        logging_dir      = os.path.join(OUTPUT_DIR, "logs"),
-        logging_strategy = "steps",
-        logging_steps    = 50,
-        report_to        = "none",
-    )
-
-
-
-def prepare_on_rank0() -> None:
+# ─── 数据准备 ──────────────────────────────────────────────────────────────────
+def prepare_on_rank0(data_path: str, seed: int) -> None:
     if all(os.path.exists(p) for p in [CACHE_TRAIN_HF, CACHE_VAL_HF]):
         log("缓存已存在，跳过预处理")
         return
 
-    log("rank0 开始读取并处理数据...")
-    df      = polars.read_parquet(DATA_PATH)
-    shuffled = df.sample(fraction=1.0, seed=SEED)
+    log(f"rank0 开始读取数据：{data_path}")
+    df       = polars.read_parquet(data_path)
+    shuffled = df.sample(fraction=1.0, seed=seed)
     n        = shuffled.height
     cut      = int(n * TRAIN_RATIO)
 
     train_seqs = shuffled.head(cut).get_column("app_name_encoded").to_list()
     val_seqs   = shuffled.tail(n - cut).get_column("app_name_encoded").to_list()
 
-    train_ds = Dataset.from_dict({"sequence": train_seqs})
-    val_ds   = Dataset.from_dict({"sequence": val_seqs})
-
-    train_ds.save_to_disk(CACHE_TRAIN_HF)
-    val_ds.save_to_disk(CACHE_VAL_HF)
-
-    log(f"数据缓存完成: train={len(train_seqs):,}, val={len(val_seqs):,}")
+    Dataset.from_dict({"sequence": train_seqs}).save_to_disk(CACHE_TRAIN_HF)
+    Dataset.from_dict({"sequence": val_seqs}).save_to_disk(CACHE_VAL_HF)
+    log(f"数据缓存完成：train={len(train_seqs):,}  val={len(val_seqs):,}")
 
 
 def load_prepared():
-    
-    # 所有进程都要等 rank0 完成数据保存后再进行
     barrier()
     train_ds = load_from_disk(CACHE_TRAIN_HF)
     val_ds   = load_from_disk(CACHE_VAL_HF)
     return train_ds["sequence"], val_ds["sequence"]
 
 
-def main():
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    rank  = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
+# ─── TrainingArguments 工厂 ────────────────────────────────────────────────────
+def make_training_args(
+    cfg:          argparse.Namespace,
+    output_dir:   str,
+    warmup_steps: int,
+) -> TrainingArguments:
+    use_fp16   = not cfg.bf16
+    use_bf16   = cfg.bf16
+    report_to  = os.environ.get("REPORT_TO", "none")  # 可设 "tensorboard" 或 "wandb"
+    enable_gc  = not cfg.no_gc
 
-    set_seed(SEED)
+    return TrainingArguments(
+        output_dir                  = output_dir,
+        seed                        = cfg.seed,
+
+        num_train_epochs            = cfg.epochs,
+        per_device_train_batch_size = cfg.batch_size,
+        per_device_eval_batch_size  = cfg.batch_size,
+        gradient_accumulation_steps = cfg.grad_accum,
+
+        learning_rate               = cfg.lr,
+        weight_decay                = 0.01,
+        warmup_steps                = warmup_steps,      # 精确步数，优于 ratio
+        lr_scheduler_type           = "cosine",
+        max_grad_norm               = 1.0,
+
+        eval_strategy               = "epoch",
+        save_strategy               = "epoch",
+        load_best_model_at_end      = True,
+        metric_for_best_model       = "eval_loss",
+        greater_is_better           = False,
+        save_total_limit            = 3,
+
+        gradient_checkpointing      = enable_gc,
+
+        ddp_find_unused_parameters  = False,
+        dataloader_num_workers      = 4,
+        dataloader_pin_memory       = True,
+
+        fp16                        = use_fp16,
+        bf16                        = use_bf16,
+
+        logging_dir                 = os.path.join(output_dir, "logs"),
+        logging_strategy            = "steps",
+        logging_steps               = 20,               # 2w 数据更细粒度
+        report_to                   = report_to,
+
+        max_steps                   = 10 if cfg.dry_run else -1,
+    )
+
+
+# ─── 主训练入口 ────────────────────────────────────────────────────────────────
+def main() -> None:
+    cfg        = parse_args()
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank       = int(os.environ.get("RANK",       0))
+    world_size = int(os.environ.get("WORLD_SIZE",  1))
+
+    set_seed(cfg.seed)
+
+    output_dir = cfg.output_dir or \
+        f"./ckpt_app_mlm_{int(datetime.datetime.now().timestamp() * 1000)}"
 
     if rank == 0:
-        print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++", flush=True)
-        print(f"WORLD_SIZE={world_size}  RANK={rank}  LOCAL_RANK={local_rank}",
-              flush=True)
+        print("=" * 70, flush=True)
+        print(f"WORLD_SIZE={world_size}  RANK={rank}  LOCAL_RANK={local_rank}", flush=True)
         for i in range(torch.cuda.device_count()):
             p = torch.cuda.get_device_properties(i)
-            print(f"GPU {i}: {p.name}  ({p.total_memory/1e9:.1f} GB)", flush=True)
-        print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++", flush=True)
-
-    if rank == 0:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+            print(f"  GPU {i}: {p.name}  ({p.total_memory / 1e9:.1f} GB)", flush=True)
+        print(
+            f"fp16={not cfg.bf16}  bf16={cfg.bf16}  "
+            f"gradient_checkpointing={not cfg.no_gc}  dry_run={cfg.dry_run}",
+            flush=True,
+        )
+        print("=" * 70, flush=True)
+        os.makedirs(output_dir, exist_ok=True)
         os.makedirs(CACHE_DIR,  exist_ok=True)
-        prepare_on_rank0()
-        
-    dist.init_process_group(backend="nccl")
+        prepare_on_rank0(cfg.data_path, cfg.seed)
+
+    # 多卡才初始化进程组，单卡直接跳过，避免挂起
+    if world_size > 1:
+        dist.init_process_group(backend="nccl")
     barrier()
 
-
     train_seqs, val_seqs = load_prepared()
-    log(f"加载完成: train={len(train_seqs):,}  val={len(val_seqs):,}")
+    log(f"加载完成：train={len(train_seqs):,}  val={len(val_seqs):,}")
 
-    train_ds = AppMLMDataset(train_seqs, is_train=True)
-    val_ds   = AppMLMDataset(val_seqs,   is_train=False, seed=SEED)
+    train_ds = AppMLMDataset(train_seqs, max_len=cfg.max_len, is_train=True,  seed=cfg.seed)
+    val_ds   = AppMLMDataset(val_seqs,   max_len=cfg.max_len, is_train=False, seed=cfg.seed)
+
+    # 精确计算 warmup steps 并打印，方便复现
+    steps_per_epoch = max(1, len(train_seqs) // (cfg.batch_size * world_size * cfg.grad_accum))
+    total_steps     = steps_per_epoch * (10 if cfg.dry_run else cfg.epochs)
+    warmup_steps    = int(total_steps * cfg.warmup_ratio)
+    log(
+        f"steps_per_epoch={steps_per_epoch}  total_steps={total_steps}  "
+        f"warmup_steps={warmup_steps}  warmup_ratio={cfg.warmup_ratio}"
+    )
 
     app_cfg   = AppConfig(
-        vocab_size=VOCAB_SIZE, hidden_size=HIDDEN, emb_size=EMB_SIZE,
-        num_hidden_layers=LAYERS, num_attention_heads=HEADS,
-        intermediate_size=FFN, max_position_embeddings=MAX_LEN,
-        pad_token_id=PAD_ID,
+        vocab_size           = VOCAB_SIZE,
+        hidden_size          = cfg.hidden,
+        emb_size             = EMB_SIZE,
+        num_hidden_layers    = cfg.layers,
+        num_attention_heads  = HEADS,
+        intermediate_size    = FFN,
+        max_position_embeddings = cfg.max_len,
+        pad_token_id         = PAD_ID,
     )
-    model_cfg = ModelConfig(app_cfg=app_cfg.to_dict(), pad_token_id=PAD_ID)
-    model     = AppMLM(model_cfg)
+    model = AppMLM(ModelConfig(app_cfg=app_cfg.to_dict(), pad_token_id=PAD_ID))
 
     if rank == 0:
         n_params = sum(p.numel() for p in model.parameters())
-        log(f"总参数: {n_params/1e6:.2f}M")
-        log(f"等效 batch = {PER_DEV_BS} × {world_size} × {GRAD_ACCUM} "
-            f"= {PER_DEV_BS * world_size * GRAD_ACCUM}")
+        log(f"总参数：{n_params / 1e6:.2f}M")
+        log(
+            f"等效 batch = {cfg.batch_size} × {world_size} × {cfg.grad_accum} "
+            f"= {cfg.batch_size * world_size * cfg.grad_accum}"
+        )
 
-    trainer = Trainer(
+    # 断点续训：自动检测已有 checkpoint
+    resume_from: Optional[str] = None
+    if os.path.isdir(output_dir):
+        ckpts = sorted(
+            [d for d in os.listdir(output_dir) if d.startswith("checkpoint-")],
+            key=lambda x: int(x.split("-")[-1]),
+        )
+        if ckpts:
+            resume_from = os.path.join(output_dir, ckpts[-1])
+            log(f"发现已有 checkpoint，从 {resume_from} 续训")
+
+    trainer = AppMLMTrainer(
         model         = model,
-        args          = make_args(),
+        args          = make_training_args(cfg, output_dir, warmup_steps),
         train_dataset = train_ds,
         eval_dataset  = val_ds,
+        callbacks     = [EarlyStoppingCallback(early_stopping_patience=cfg.patience)],
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from)
 
     if rank == 0:
-        save_path = os.path.join(OUTPUT_DIR, "final")
+        save_path = os.path.join(output_dir, "final")
         trainer.save_model(save_path)
         log(f"模型已保存至 {save_path}")
 
