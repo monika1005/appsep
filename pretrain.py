@@ -19,9 +19,10 @@ from datasets import Dataset, load_from_disk
 from torch.utils.data import Dataset as TorchDataset
 from transformers import TrainingArguments
 
-from appsep import AppConfig, AppMLM, ModelConfig, AppMLMDataset
-from appsep.config import PretrainConfig, make_argparser, apply_cli_args
-from appsep.utils.trainer import create_trainer
+from models.mlm import AppConfig, AppMLM, ModelConfig
+from data.dataset import AppMLMDataset
+from config import PretrainConfig, make_argparser, apply_cli_args
+from utils.trainer import create_trainer
 
 
 # ============================================================

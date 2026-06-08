@@ -15,9 +15,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
 
-from appsep.models.base import AppConfig, ModelConfig
-from appsep.models.embeddings import AppEmbeddings
-from appsep.models.encoder import BertEncoderWithRoPE
+from models.base import AppConfig, ModelConfig
+from models.embeddings import AppEmbeddings
+from models.encoder import BertEncoderWithRoPE
 
 
 class AppMLM(PreTrainedModel):

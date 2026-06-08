@@ -1,55 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-@file: torch2onnx.py
+@file: torch2onnx_single.py
 @author: YQ
 @date: 2026-06-08
-@desc: 永申 侧不支持直接torch推理，需要转换为onnx
+@desc: 导出无 batch 维度的 ONNX 模型（单条推理）
+      输入输出 shape 不含 batch_size 维度，开发侧直接使用单条输入
+
+CLs 模型:
+  input:  input_ids [seq], attention_mask [seq]
+  output: logits [num_labels]
+
+Embedding 模型:
+  input:  input_ids [seq], attention_mask [seq]
+  output: cls_emb [hidden], mean_emb [hidden], hidden_states [seq, hidden]
 """
-
-"""
-
-此模型推理包含 分类模型、向量Emb 模型两个推理模型，
-app_seq 是 app 列表转成的数字 id 序列,不足长度补 0,永申 自己做个转换
-
-
-
-输入字段固定，attention_mask 由 input_ids 自动生成，无需业务额外传参。
-
-
-模型需要两个输入：
-1. input_ids(int64[][]):app 列表转成的数字 id 序列,不足长度补 0
-2. attention_mask(int64[][]):和 input_ids 长度一样,id 非 0 填 1,id 是 0 填 0
-
-
-{
-  "input_ids": [[10023, 8841, 8294, 0, 0, 0]],
-  "attention_mask": [[1, 1, 1, 0, 0, 0]]
-}
-"""
-'''伪码
-def app_seq_to_model_input(app_seq, max_len):
-    """
-    业务特征 app_seq  模型需要的 input_ids + attention_mask
-    :param app_seq:  已映射的ID列表，如 [10,245,308,...]
-    :param max_len:  模型要求固定长度 20
-    :return: input_ids, attention_mask
-    """
-    # 1. 截断超长部分
-    seq = app_seq[:max_len]
-    
-    # 2. 计算需要补多少个 0
-    pad_len = max_len - len(seq)
-    
-    # 3. 生成模型输入 input_ids（末尾补0）
-    input_ids = seq + [0] * pad_len
-    
-    # 4. 生成 attention_mask（1=有效，0=补位）
-    attention_mask = [1] * len(seq) + [0] * pad_len
-    
-    return input_ids, attention_mask
-'''
-
 
 import os
 import time
@@ -64,25 +29,22 @@ print("onnxruntime:", version("onnxruntime"))
 print("transformers:", version("transformers"))
 
 from app_cls import AppCLS, MAX_LEN, PAD_ID, CLS_ID, SEP_ID
-from appsep.pretrain import AppMLM
-
-
-
+from pretrain import AppMLM
 
 
 # =============== 配置 ===============
-parser = argparse.ArgumentParser(description="PyTorch → ONNX 转换 & 对比")
+parser = argparse.ArgumentParser(description="PyTorch → ONNX（单条，无 batch 维度）")
 parser.add_argument("--torch_model", type=str,
                     default="/Users/yuqing/Desktop/appseq/appsep/ckpt_app_cls/final/",
                     help="PyTorch CLS 模型目录")
 parser.add_argument("--onnx_model", type=str,
-                    default="/Users/yuqing/Desktop/appseq/appsep/app_cls_new1.onnx",
+                    default="/Users/yuqing/Desktop/appseq/appsep/app_cls_single.onnx",
                     help="导出的 ONNX CLS 模型路径")
 parser.add_argument("--torch_model_mlm", type=str,
                     default="/Users/yuqing/Desktop/appseq/appsep/ckpt_app_mlm/final/",
                     help="PyTorch MLM 模型目录")
 parser.add_argument("--onnx_model_mlm", type=str,
-                    default="/Users/yuqing/Desktop/appseq/appsep/app_mlm_new1.onnx",
+                    default="/Users/yuqing/Desktop/appseq/appsep/app_mlm_single.onnx",
                     help="导出的 ONNX MLM embedding 模型路径")
 args = parser.parse_args()
 
@@ -103,7 +65,7 @@ model = AppCLS.from_pretrained(TORCH_MODEL_PATH)
 model.eval()
 
 
-# =============== 0a. 导出 MLM Embedding 为 ONNX ===============
+# =============== 0a. 导出 MLM Embedding 为 ONNX（无 batch） ===============
 class AppEmbForOnnx(nn.Module):
     """将 MLM 模型的 embedding + encoder 提取为独立 ONNX，输出 cls/mean/hidden"""
     def __init__(self, mlm_model):
@@ -112,6 +74,10 @@ class AppEmbForOnnx(nn.Module):
         self.bert           = mlm_model.bert
 
     def forward(self, input_ids, attention_mask):
+        # input_ids: [seq], attention_mask: [seq]  → unsqueeze 加 batch 维度
+        input_ids      = input_ids.unsqueeze(0)       # [1, seq]
+        attention_mask = attention_mask.unsqueeze(0)   # [1, seq]
+
         hidden = self.app_embeddings(input_ids)
 
         extended_mask = attention_mask[:, None, None, :].to(hidden.dtype)
@@ -125,11 +91,12 @@ class AppEmbForOnnx(nn.Module):
         else:
             hidden = out
 
-        cls_emb  = hidden[:, 0, :]
+        cls_emb  = hidden[:, 0, :].squeeze(0)       # [hidden]
         mask_e   = attention_mask.unsqueeze(-1).to(hidden.dtype)
         sum_emb  = (hidden * mask_e).sum(dim=1)
         sum_mask = mask_e.sum(dim=1).clamp(min=1e-9)
-        mean_emb = sum_emb / sum_mask
+        mean_emb = (sum_emb / sum_mask).squeeze(0)   # [hidden]
+        hidden   = hidden.squeeze(0)                  # [seq, hidden]
 
         return cls_emb, mean_emb, hidden
 
@@ -140,9 +107,8 @@ emb_model.to("cpu")
 
 print(f"开始导出 MLM Embedding ONNX → {ONNX_MODEL_PATH_MLM}")
 
-batch_size = 1
-dummy_input_ids      = torch.randint(0, 10000, (batch_size, MAX_LEN_EXPORT), dtype=torch.long)
-dummy_attention_mask = torch.ones((batch_size, MAX_LEN_EXPORT), dtype=torch.long)
+dummy_input_ids      = torch.randint(0, 10000, (MAX_LEN_EXPORT,), dtype=torch.long)
+dummy_attention_mask = torch.ones((MAX_LEN_EXPORT,), dtype=torch.long)
 
 torch.onnx.export(
     emb_model,
@@ -151,11 +117,11 @@ torch.onnx.export(
     input_names  = ["input_ids", "attention_mask"],
     output_names = ["cls_emb", "mean_emb", "hidden_states"],
     dynamic_axes = {
-        "input_ids":       {0: "batch", 1: "seq"},
-        "attention_mask":  {0: "batch", 1: "seq"},
-        "cls_emb":         {0: "batch"},
-        "mean_emb":        {0: "batch"},
-        "hidden_states":   {0: "batch", 1: "seq"},
+        "input_ids":      {0: "seq"},
+        "attention_mask": {0: "seq"},
+        "cls_emb":        {},
+        "mean_emb":       {},
+        "hidden_states":  {0: "seq"},
     },
     opset_version=14,
     do_constant_folding=True,
@@ -164,16 +130,20 @@ torch.onnx.export(
 print(f"✅ MLM Embedding ONNX 导出完成: {ONNX_MODEL_PATH_MLM}")
 
 
-# =============== 0b. 导出 CLS 分类模型为 ONNX ===============
+# =============== 0b. 导出 CLS 分类模型为 ONNX（无 batch） ===============
 class AppCLSForOnnx(nn.Module):
-    """包装 CLS 模型，只输出 logits tensor"""
+    """包装 CLS 模型，单条输入，只输出 logits tensor"""
     def __init__(self, m: AppCLS):
         super().__init__()
         self.m = m
 
     def forward(self, input_ids, attention_mask):
+        # input_ids: [seq], attention_mask: [seq]  → unsqueeze 加 batch 维度
+        input_ids      = input_ids.unsqueeze(0)       # [1, seq]
+        attention_mask = attention_mask.unsqueeze(0)   # [1, seq]
         out = self.m(input_ids=input_ids, attention_mask=attention_mask)
-        return out["logits"]
+        return out["logits"].squeeze(0)  # [num_labels]
+
 
 export_model = AppCLSForOnnx(model)
 export_model.eval()
@@ -188,9 +158,9 @@ torch.onnx.export(
     input_names  = ["input_ids", "attention_mask"],
     output_names = ["logits"],
     dynamic_axes = {
-        "input_ids":      {0: "batch", 1: "seq"},
-        "attention_mask": {0: "batch", 1: "seq"},
-        "logits":         {0: "batch"},
+        "input_ids":      {0: "seq"},
+        "attention_mask": {0: "seq"},
+        "logits":         {},
     },
     opset_version=14,
     do_constant_folding=True,
@@ -199,12 +169,11 @@ torch.onnx.export(
 print(f"✅ CLS ONNX 导出完成: {ONNX_MODEL_PATH}")
 
 
-# =============== 1. 加载 ONNX 模型 ===============
+# =============== 1. 加载推理模型 ===============
 print("=" * 60)
 print("加载推理模型")
 print("=" * 60)
 
-# PyTorch 模型直接复用
 torch_model = model
 torch_model.eval()
 print(f"✅ PyTorch CLS 模型已加载: {TORCH_MODEL_PATH}")
@@ -213,7 +182,6 @@ torch_model_mlm = model_mlm
 torch_model_mlm.eval()
 print(f"✅ PyTorch MLM 模型已加载: {TORCH_MODEL_PATH_MLM}")
 
-# ONNX 模型
 sess_options = ort.SessionOptions()
 sess_options.intra_op_num_threads = 4
 sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -232,72 +200,76 @@ ort_sess_emb = ort.InferenceSession(
 )
 print(f"✅ ONNX MLM Embedding 模型已加载: {ONNX_MODEL_PATH_MLM}")
 
+# 打印模型输入输出 shape，确认无 batch 维度
+print("\n--- CLS ONNX 输入/输出 ---")
+for inp in ort_sess_cls.get_inputs():
+    print(f"  输入 {inp.name}: {inp.shape}  dtype={inp.type}")
+for out in ort_sess_cls.get_outputs():
+    print(f"  输出 {out.name}: {out.shape}  dtype={out.type}")
+
+print("\n--- Emb ONNX 输入/输出 ---")
+for inp in ort_sess_emb.get_inputs():
+    print(f"  输入 {inp.name}: {inp.shape}  dtype={inp.type}")
+for out in ort_sess_emb.get_outputs():
+    print(f"  输出 {out.name}: {out.shape}  dtype={out.type}")
+
 
 # =============== 2. 预处理 ===============
-def build_batch(token_ids_list, max_len=MAX_LEN, pad_id=PAD_ID):
-    """List[List[int]] → (input_ids, attention_mask) numpy 数组"""
-    n = len(token_ids_list)
-    input_ids      = np.full((n, max_len), pad_id, dtype=np.int64)
-    attention_mask = np.zeros((n, max_len), dtype=np.int64)
-    for j, ids in enumerate(token_ids_list):
-        ids = ids[:max_len]
-        input_ids[j, :len(ids)]      = ids
-        attention_mask[j, :len(ids)] = 1
+def build_single(token_ids, max_len=MAX_LEN, pad_id=PAD_ID):
+    """List[int] → (input_ids, attention_mask) 1-D numpy 数组"""
+    ids = token_ids[:max_len]
+    pad_len = max_len - len(ids)
+    input_ids      = np.array(ids + [pad_id] * pad_len, dtype=np.int64)
+    attention_mask = np.array([1] * len(ids) + [0] * pad_len, dtype=np.int64)
     return input_ids, attention_mask
 
 
 def softmax_np(logits):
     """数值稳定的 softmax"""
-    e = np.exp(logits - logits.max(axis=1, keepdims=True))
-    return e / e.sum(axis=1, keepdims=True)
+    e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
 
 
-# =============== 3. CLS 推理方法 ===============
-def predict_cls_torch(token_ids_list, batch_size=64):
-    """PyTorch CLS 推理"""
+# =============== 3. CLS 推理函数（逐条） ===============
+def predict_cls_torch(token_ids_list):
+    """PyTorch CLS 逐条推理"""
     all_probs = []
-    for i in range(0, len(token_ids_list), batch_size):
-        batch = token_ids_list[i:i+batch_size]
-        input_ids, attention_mask = build_batch(batch)
-
+    for ids in token_ids_list:
+        input_ids, attention_mask = build_single(ids)
         with torch.no_grad():
             out = torch_model(
-                input_ids=torch.from_numpy(input_ids),
-                attention_mask=torch.from_numpy(attention_mask),
+                input_ids=torch.from_numpy(input_ids).unsqueeze(0),
+                attention_mask=torch.from_numpy(attention_mask).unsqueeze(0),
             )
-            logits = out["logits"].numpy()
+            logits = out["logits"].numpy()  # [1, num_labels]
+        all_probs.append(softmax_np(logits[0]))
+    return np.stack(all_probs, axis=0)
 
-        all_probs.append(softmax_np(logits))
-    return np.concatenate(all_probs, axis=0)
 
-
-def predict_cls_onnx(token_ids_list, batch_size=64):
-    """ONNX CLS 推理"""
+def predict_cls_onnx(token_ids_list):
+    """ONNX CLS 逐条推理（无 batch 维度）"""
     all_probs = []
-    for i in range(0, len(token_ids_list), batch_size):
-        batch = token_ids_list[i:i+batch_size]
-        input_ids, attention_mask = build_batch(batch)
-
+    for ids in token_ids_list:
+        input_ids, attention_mask = build_single(ids)
         logits = ort_sess_cls.run(None, {
             "input_ids":      input_ids,
             "attention_mask": attention_mask,
-        })[0]
-
+        })[0]  # [num_labels]
         all_probs.append(softmax_np(logits))
-    return np.concatenate(all_probs, axis=0)
+    return np.stack(all_probs, axis=0)
 
 
-# =============== 3b. MLM Embedding 推理方法 ===============
-def predict_emb_torch(token_ids_list, batch_size=64):
-    """PyTorch MLM embedding 推理，返回 (cls_emb, mean_emb, hidden_states)"""
+# =============== 3b. Embedding 推理函数（逐条） ===============
+def predict_emb_torch(token_ids_list):
+    """PyTorch Embedding 逐条推理"""
     all_cls, all_mean, all_hidden = [], [], []
-    for i in range(0, len(token_ids_list), batch_size):
-        batch = token_ids_list[i:i+batch_size]
-        input_ids, attention_mask = build_batch(batch)
-
+    for ids in token_ids_list:
+        input_ids, attention_mask = build_single(ids)
         with torch.no_grad():
-            hidden = torch_model_mlm.app_embeddings(torch.from_numpy(input_ids))
-            ext_mask = (1.0 - torch.from_numpy(attention_mask)[:, None, None, :].float()) * -10000.0
+            hidden = torch_model_mlm.app_embeddings(
+                torch.from_numpy(input_ids).unsqueeze(0))
+            am = torch.from_numpy(attention_mask).unsqueeze(0).float()  # [1, seq]
+            ext_mask = (1.0 - am[:, None, None, :]) * -10000.0         # [1, 1, 1, seq]
             out = torch_model_mlm.bert(hidden, attention_mask=ext_mask)
             if isinstance(out, tuple):
                 h = out[0]
@@ -306,35 +278,32 @@ def predict_emb_torch(token_ids_list, batch_size=64):
             else:
                 h = out
 
-            cls_emb  = h[:, 0, :].numpy()
-            mask_e   = torch.from_numpy(attention_mask).unsqueeze(-1).float()
-            sum_emb  = (h * mask_e).sum(dim=1)
-            sum_mask = mask_e.sum(dim=1).clamp(min=1e-9)
-            mean_emb = (sum_emb / sum_mask).numpy()
-            hidden_np = h.numpy()
+            cls_emb = h[0, 0, :].numpy()                                    # [hidden]
+            mask_e  = torch.from_numpy(attention_mask).unsqueeze(-1).float()  # [seq, 1]
+            sum_emb = (h.squeeze(0) * mask_e).sum(dim=0)
+            sum_mask = mask_e.sum(dim=0).clamp(min=1e-9)
+            mean_emb = (sum_emb / sum_mask).numpy()                          # [hidden]
+            hidden_np = h.squeeze(0).numpy()                                 # [seq, hidden]
 
         all_cls.append(cls_emb)
         all_mean.append(mean_emb)
         all_hidden.append(hidden_np)
-    return np.concatenate(all_cls, axis=0), np.concatenate(all_mean, axis=0), np.concatenate(all_hidden, axis=0)
+    return np.stack(all_cls), np.stack(all_mean), np.stack(all_hidden)
 
 
-def predict_emb_onnx(token_ids_list, batch_size=64):
-    """ONNX MLM embedding 推理，返回 (cls_emb, mean_emb, hidden_states)"""
+def predict_emb_onnx(token_ids_list):
+    """ONNX Embedding 逐条推理（无 batch 维度）"""
     all_cls, all_mean, all_hidden = [], [], []
-    for i in range(0, len(token_ids_list), batch_size):
-        batch = token_ids_list[i:i+batch_size]
-        input_ids, attention_mask = build_batch(batch)
-
+    for ids in token_ids_list:
+        input_ids, attention_mask = build_single(ids)
         cls_emb, mean_emb, hidden_np = ort_sess_emb.run(None, {
             "input_ids":      input_ids,
             "attention_mask": attention_mask,
         })
-
         all_cls.append(cls_emb)
         all_mean.append(mean_emb)
         all_hidden.append(hidden_np)
-    return np.concatenate(all_cls, axis=0), np.concatenate(all_mean, axis=0), np.concatenate(all_hidden, axis=0)
+    return np.stack(all_cls), np.stack(all_mean), np.stack(all_hidden)
 
 
 # =============== 4. 准备测试数据 ===============
@@ -402,7 +371,7 @@ else:
     print("\n❌ CLS 精度差异过大 (> 1e-3)，需要排查导出问题！")
 
 
-# =============== 5b. MLM Embedding 精度对比 ===============
+# =============== 5b. Embedding 精度对比 ===============
 print("\n" + "=" * 60)
 print("MLM Embedding 精度对比")
 print("=" * 60)

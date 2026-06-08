@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertConfig
 
-from appsep.utils.rope import RotaryEmbedding
+from utils.rope import RotaryEmbedding
 
 
 class BertAttentionWithRoPE(nn.Module):

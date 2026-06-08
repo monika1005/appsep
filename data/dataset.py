@@ -18,7 +18,7 @@ import polars as pl
 import torch
 from torch.utils.data import Dataset
 
-from appsep.config import CLSConfig, PAD_ID, CLS_ID, SEP_ID, MASK_ID
+from config import CLSConfig, PAD_ID, CLS_ID, SEP_ID, MASK_ID
 
 
 # =========================================================
