@@ -9,7 +9,7 @@
 
 CLs 模型:
   input:  input_ids [seq], attention_mask [seq]
-  output: logits [num_labels]
+  output: logits [num_labels], hidden_states [seq, hidden]
 
 Embedding 模型:
   input:  input_ids [seq], attention_mask [seq]
@@ -132,7 +132,7 @@ print(f"✅ MLM Embedding ONNX 导出完成: {ONNX_MODEL_PATH_MLM}")
 
 # =============== 0b. 导出 CLS 分类模型为 ONNX（无 batch） ===============
 class AppCLSForOnnx(nn.Module):
-    """包装 CLS 模型，单条输入，只输出 logits tensor"""
+    """包装 CLS 模型，单条输入，输出 logits + 最后一层 hidden_states"""
     def __init__(self, m: AppCLS):
         super().__init__()
         self.m = m
@@ -141,8 +141,16 @@ class AppCLSForOnnx(nn.Module):
         # input_ids: [seq], attention_mask: [seq]  → unsqueeze 加 batch 维度
         input_ids      = input_ids.unsqueeze(0)       # [1, seq]
         attention_mask = attention_mask.unsqueeze(0)   # [1, seq]
-        out = self.m(input_ids=input_ids, attention_mask=attention_mask)
-        return out["logits"].squeeze(0)  # [num_labels]
+
+        dtype    = self.m.app_embeddings.word_embeddings.weight.dtype
+        ext_mask = self.m.get_extended_attention_mask(attention_mask, dtype)
+        seq_out  = self.m.bert(self.m.app_embeddings(input_ids), attention_mask=ext_mask)[0]
+
+        cls_emb = seq_out[:, 0, :]
+        cls_emb = self.m.dropout(cls_emb)
+        logits  = self.m.classifier(cls_emb)
+
+        return logits.squeeze(0), seq_out.squeeze(0)  # [num_labels], [seq, hidden]
 
 
 export_model = AppCLSForOnnx(model)
@@ -156,11 +164,12 @@ torch.onnx.export(
     (dummy_input_ids, dummy_attention_mask),
     ONNX_MODEL_PATH,
     input_names  = ["input_ids", "attention_mask"],
-    output_names = ["logits"],
+    output_names = ["logits", "hidden_states"],
     dynamic_axes = {
         "input_ids":      {0: "seq"},
         "attention_mask": {0: "seq"},
         "logits":         {},
+        "hidden_states":  {0: "seq"},
     },
     opset_version=14,
     do_constant_folding=True,
@@ -232,31 +241,37 @@ def softmax_np(logits):
 
 # =============== 3. CLS 推理函数（逐条） ===============
 def predict_cls_torch(token_ids_list):
-    """PyTorch CLS 逐条推理"""
-    all_probs = []
+    """PyTorch CLS 逐条推理，返回 (probs, hidden_states)"""
+    all_probs, all_hidden = [], []
     for ids in token_ids_list:
         input_ids, attention_mask = build_single(ids)
         with torch.no_grad():
-            out = torch_model(
-                input_ids=torch.from_numpy(input_ids).unsqueeze(0),
-                attention_mask=torch.from_numpy(attention_mask).unsqueeze(0),
-            )
-            logits = out["logits"].numpy()  # [1, num_labels]
-        all_probs.append(softmax_np(logits[0]))
-    return np.stack(all_probs, axis=0)
+            tid = torch.from_numpy(input_ids).unsqueeze(0)
+            tam = torch.from_numpy(attention_mask).unsqueeze(0)
+            dtype    = torch_model.app_embeddings.word_embeddings.weight.dtype
+            ext_mask = torch_model.get_extended_attention_mask(tam, dtype)
+            seq_out  = torch_model.bert(torch_model.app_embeddings(tid), attention_mask=ext_mask)[0]
+            cls_emb  = seq_out[:, 0, :]
+            cls_emb  = torch_model.dropout(cls_emb)
+            logits   = torch_model.classifier(cls_emb).numpy()[0]  # [num_labels]
+            hidden_np = seq_out.squeeze(0).numpy()                  # [seq, hidden]
+        all_probs.append(softmax_np(logits))
+        all_hidden.append(hidden_np)
+    return np.stack(all_probs, axis=0), np.stack(all_hidden, axis=0)
 
 
 def predict_cls_onnx(token_ids_list):
-    """ONNX CLS 逐条推理（无 batch 维度）"""
-    all_probs = []
+    """ONNX CLS 逐条推理（无 batch 维度），返回 (probs, hidden_states)"""
+    all_probs, all_hidden = [], []
     for ids in token_ids_list:
         input_ids, attention_mask = build_single(ids)
-        logits = ort_sess_cls.run(None, {
+        logits, hidden_np = ort_sess_cls.run(None, {
             "input_ids":      input_ids,
             "attention_mask": attention_mask,
-        })[0]  # [num_labels]
+        })
         all_probs.append(softmax_np(logits))
-    return np.stack(all_probs, axis=0)
+        all_hidden.append(hidden_np)
+    return np.stack(all_probs, axis=0), np.stack(all_hidden, axis=0)
 
 
 # =============== 3b. Embedding 推理函数（逐条） ===============
@@ -338,8 +353,8 @@ print("CLS 精度对比")
 print("=" * 60)
 
 print("\n--- 简单样本 ---")
-torch_probs = predict_cls_torch(simple_samples)
-onnx_probs  = predict_cls_onnx(simple_samples)
+torch_probs, torch_hidden = predict_cls_torch(simple_samples)
+onnx_probs,  onnx_hidden  = predict_cls_onnx(simple_samples)
 
 for i in range(len(simple_samples)):
     print(f"\nSample {i}:")
@@ -348,27 +363,34 @@ for i in range(len(simple_samples)):
     print(f"  差异:          {np.abs(torch_probs[i] - onnx_probs[i])}")
     print(f"  PyTorch pred:  {torch_probs[i].argmax()}")
     print(f"  ONNX    pred:  {onnx_probs[i].argmax()}")
+    h_diff = np.abs(torch_hidden[i] - onnx_hidden[i])
+    print(f"  hidden 最大误差: {h_diff.max():.6e}  平均误差: {h_diff.mean():.6e}")
 
 print("\n--- 100 条随机样本统计 ---")
-torch_probs = predict_cls_torch(random_samples)
-onnx_probs  = predict_cls_onnx(random_samples)
+torch_probs, torch_hidden = predict_cls_torch(random_samples)
+onnx_probs,  onnx_hidden  = predict_cls_onnx(random_samples)
 
 abs_diff = np.abs(torch_probs - onnx_probs)
 print(f"概率最大绝对误差:   {abs_diff.max():.6e}")
 print(f"概率平均绝对误差:   {abs_diff.mean():.6e}")
 print(f"概率 99% 分位误差:  {np.percentile(abs_diff, 99):.6e}")
 
+h_diff = np.abs(torch_hidden - onnx_hidden)
+print(f"\nhidden_states 最大绝对误差:   {h_diff.max():.6e}")
+print(f"hidden_states 平均绝对误差:   {h_diff.mean():.6e}")
+print(f"hidden_states 99% 分位误差:   {np.percentile(h_diff, 99):.6e}")
+
 torch_pred = torch_probs.argmax(axis=1)
 onnx_pred  = onnx_probs.argmax(axis=1)
 agreement = (torch_pred == onnx_pred).mean()
 print(f"类别预测一致率:     {agreement * 100:.2f}%")
 
-if abs_diff.max() < 1e-4:
-    print("\n✅ CLS 精度完全一致 (< 1e-4)，可放心上线")
-elif abs_diff.max() < 1e-3:
-    print("\n⚠️  CLS 精度差异略大 (1e-4 ~ 1e-3)，可接受但建议检查")
+if abs_diff.max() < 1e-4 and h_diff.max() < 1e-4:
+    print("\n✅ CLS logits + hidden_states 精度完全一致 (< 1e-4)，可放心上线")
+elif abs_diff.max() < 1e-3 and h_diff.max() < 1e-3:
+    print("\n⚠️  精度差异略大 (1e-4 ~ 1e-3)，可接受但建议检查")
 else:
-    print("\n❌ CLS 精度差异过大 (> 1e-3)，需要排查导出问题！")
+    print("\n❌ 精度差异过大 (> 1e-3)，需要排查导出问题！")
 
 
 # =============== 5b. Embedding 精度对比 ===============
